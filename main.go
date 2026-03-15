@@ -363,7 +363,7 @@ func (m *TokenManager) saveTokenToRedisWithPrefix(appid string, tokenInfo *Token
 		return err
 	}
 
-	expire := tokenInfo.ExpireTime.Sub(time.Now()) + 5*time.Minute
+	expire := time.Until(tokenInfo.ExpireTime) + 5*time.Minute
 	if err := redisClient.SetEX(ctx, key, data, expire).Err(); err != nil {
 		logger.Error("Redis保存token失败", zap.String("appid", appid), zap.Error(err))
 		return err
@@ -515,7 +515,14 @@ func (m *TokenManager) getAccessTokenWithPrefix(appid, prefix string) (*TokenInf
 	if !lockSuccess {
 		logger.Debug("未拿到分布式锁，等待后重试读取Token", zap.String("appid", appid))
 		time.Sleep(1 * time.Second)
-		return m.getTokenFromRedisWithPrefix(appid, prefix)
+		tokenInfo, err = m.getTokenFromRedisWithPrefix(appid, prefix)
+		if err != nil {
+			return nil, fmt.Errorf("等待锁释放后读取Token失败: %v", err)
+		}
+		if !m.isTokenValid(tokenInfo) {
+			return nil, fmt.Errorf("等待锁释放后Token仍然无效（appid=%s），请稍后重试", appid)
+		}
+		return tokenInfo, nil
 	}
 
 	// 拿到锁：确保解锁（即使panic也能释放）
