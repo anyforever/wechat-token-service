@@ -1,0 +1,41 @@
+server:
+  # 服务监听地址及超时设置
+  port: ":8080"
+  read_timeout: "5s"
+  write_timeout: "10s"
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+  prefix: "wx_token"
+
+wechat:
+  token_api: "https://api.weixin.qq.com/cgi-bin/token"
+  refresh_ahead: 3600
+  auto_refresh_interval: "10m"
+
+api:
+  # RSA 公钥，用于签名验证
+  rsa_public_key: |
+    -----BEGIN PUBLIC KEY-----
+    YOUR_RSA_PUBLIC_KEY_HERE
+    -----END PUBLIC KEY-----
+  sign_expire_hours: 2
+  clients:
+    - appid: "your_client_appid"
+      secret: "your_client_secret"
+      status: "enabled"
+
+logger:
+  level: "info"
+  encoding: "json"
+  output_path: "stdout"  # stdout 或日志文件路径
+  max_size: 100
+  max_backup: 7
+  max_age: 30
+  compress: false
+
+accounts:
+  - appid: "wx123"
+    appsecret: "secret123"

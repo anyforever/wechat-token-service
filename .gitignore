@@ -1,0 +1,34 @@
+# ============================
+# Sensitive configuration files
+# ============================
+
+# Real config (contains appid/secret/redis credentials)
+# Use config/config.yaml.example as a template instead
+config/config.yaml
+
+# RSA private key — NEVER commit this
+config/private.key
+
+# RSA public key (optional: commit if you need it for client verification)
+config/public.key
+
+
+# ============================
+# Build artifacts
+# ============================
+
+# Compiled binary
+wechat-token-manager
+
+# Cross-platform build output
+dist/
+
+# macOS metadata
+.DS_Store
+
+
+# ============================
+# Logs
+# ============================
+logs/
+*.log
