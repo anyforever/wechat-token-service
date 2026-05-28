@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,13 @@ import (
 
 // -------------------------- 版本信息 --------------------------
 var Version = "v1.0.0" // 编译时注入版本号
+
+const (
+	requestTimeout     = 10 * time.Second
+	maxRefreshRetries  = 3
+	tokenLockExpire    = 75 * time.Second
+	signatureClockSkew = 5 * time.Minute
+)
 
 // -------------------------- 统一响应结构体 --------------------------
 type Response struct {
@@ -116,15 +124,15 @@ type TokenInfo struct {
 
 // -------------------------- 全局变量 --------------------------
 var (
-	cfg          Config
-	cfgMutex     sync.RWMutex
-	logger       *zap.Logger
-	redisClient  *redis.Client
-	manager      *TokenManager
+	cfg            Config
+	cfgMutex       sync.RWMutex
+	logger         *zap.Logger
+	redisClient    *redis.Client
+	manager        *TokenManager
 	ctx, ctxCancel = context.WithCancel(context.Background())
-	rsaPublicKey *rsa.PublicKey
-	clientCache  map[string]APIClient
-	clientMutex  sync.RWMutex
+	rsaPublicKey   *rsa.PublicKey
+	clientCache    map[string]APIClient
+	clientMutex    sync.RWMutex
 
 	// 服务就绪状态
 	serverReady bool
@@ -185,7 +193,7 @@ type TokenManager struct {
 func NewTokenManager(accounts []Account, weChatConfig WeChatConfig) *TokenManager {
 	m := &TokenManager{
 		accounts:     make(map[string]Account),
-		client:       resty.New().SetTimeout(10 * time.Second),
+		client:       resty.New().SetTimeout(requestTimeout),
 		weChatConfig: weChatConfig,
 		locker:       NewRedisLock(redisClient, ctx),
 		Version:      Version, // 初始化版本
@@ -385,7 +393,7 @@ func (m *TokenManager) isTokenValid(tokenInfo *TokenInfo) bool {
 func (m *TokenManager) refreshTokenFromWeChat(appid string, account Account) (*TokenInfo, error) {
 	weChatCfg := m.GetWeChatConfig()
 
-	const maxRetries = 3
+	const maxRetries = maxRefreshRetries
 	retryDelay := 500 * time.Millisecond
 
 	var lastErr error
@@ -468,6 +476,10 @@ func (m *TokenManager) doRefreshTokenFromWeChat(appid string, account Account, w
 		logger.Error("微信API返回错误码", zap.String("appid", appid), zap.Int("errcode", wxResp.Errcode), zap.String("errmsg", wxResp.Errmsg))
 		return nil, fmt.Errorf("微信API错误: errcode=%d, errmsg=%s", wxResp.Errcode, wxResp.Errmsg)
 	}
+	if wxResp.AccessToken == "" || wxResp.ExpiresIn <= 0 {
+		logger.Error("微信API返回无效token", zap.String("appid", appid), zap.Int64("expires_in", wxResp.ExpiresIn))
+		return nil, fmt.Errorf("微信API返回无效token: access_token_empty=%t, expires_in=%d", wxResp.AccessToken == "", wxResp.ExpiresIn)
+	}
 
 	now := time.Now()
 	return &TokenInfo{
@@ -505,7 +517,7 @@ func (m *TokenManager) getAccessTokenWithPrefix(appid, prefix string) (*TokenInf
 	}
 
 	// 第三步：Token失效，申请分布式锁准备刷新
-	lockExpire := 30 * time.Second
+	lockExpire := tokenLockExpire
 	lockSuccess, lockToken, err := m.locker.Lock(appid, lockExpire)
 	if err != nil {
 		return nil, fmt.Errorf("申请分布式锁失败: %v", err)
@@ -613,7 +625,7 @@ func (m *TokenManager) StartAutoRefresh() {
 
 // 主节点选举：锁的有效期仅覆盖一个刷新周期，宕机后下一周期其他节点可自动接管
 func (m *TokenManager) electMaster() (bool, error) {
-	masterKey := fmt.Sprintf("%s:lock:master", cfg.Redis.Prefix)
+	masterKey := fmt.Sprintf("%s:lock:master", getRedisPrefix())
 	// 锁有效期 = 刷新间隔 + 30秒缓冲，仅覆盖当前轮次，避免主节点宕机后长时间无法切换
 	masterExpire := m.GetWeChatConfig().AutoRefreshInterval + 30*time.Second
 	res, err := redisClient.SetNX(ctx, masterKey, "1", masterExpire).Result()
@@ -657,7 +669,7 @@ func genLockToken() string {
 }
 
 func (l *RedisLock) Lock(appid string, expire time.Duration) (bool, string, error) {
-	lockKey := fmt.Sprintf("%s:lock:token:%s", cfg.Redis.Prefix, appid)
+	lockKey := fmt.Sprintf("%s:lock:token:%s", getRedisPrefix(), appid)
 	token := genLockToken()
 	res, err := l.client.SetNX(l.ctx, lockKey, token, expire).Result()
 	if err != nil {
@@ -668,7 +680,7 @@ func (l *RedisLock) Lock(appid string, expire time.Duration) (bool, string, erro
 }
 
 func (l *RedisLock) Unlock(appid, token string) error {
-	lockKey := fmt.Sprintf("%s:lock:token:%s", cfg.Redis.Prefix, appid)
+	lockKey := fmt.Sprintf("%s:lock:token:%s", getRedisPrefix(), appid)
 	result, err := unlockScript.Run(l.ctx, l.client, []string{lockKey}, token).Int()
 	if err != nil {
 		logger.Warn("Redis解锁失败", zap.String("appid", appid), zap.Error(err))
@@ -684,12 +696,24 @@ func (l *RedisLock) Unlock(appid, token string) error {
 // -------------------------- 签名验证工具函数 --------------------------
 func loadRSAPublicKey() error {
 	cfgMutex.RLock()
-	publicKeyContent := cfg.API.RSAPublicKey
+	publicKeyContent := strings.TrimSpace(cfg.API.RSAPublicKey)
 	cfgMutex.RUnlock()
+
+	if publicKeyContent == "" {
+		return errors.New("RSA公钥配置为空")
+	}
+
+	if !strings.Contains(publicKeyContent, "-----BEGIN") {
+		keyData, err := os.ReadFile(publicKeyContent)
+		if err != nil {
+			return fmt.Errorf("读取RSA公钥文件失败: path=%s, err=%v", publicKeyContent, err)
+		}
+		publicKeyContent = string(keyData)
+	}
 
 	block, _ := pem.Decode([]byte(publicKeyContent))
 	if block == nil {
-		return errors.New("解析公钥失败")
+		return errors.New("解析公钥失败：请确认配置为PEM格式公钥内容，或指向PEM公钥文件路径")
 	}
 
 	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
@@ -770,6 +794,10 @@ func verifySignature(appid, signature, timestampStr string) (int, error) {
 	if now.Sub(signTime) > time.Duration(signExpireHours)*time.Hour {
 		return CodeUnauthorized, fmt.Errorf("签名已过期，签名时间: %s，当前时间: %s，有效期: %d小时",
 			signTime.Format(time.RFC3339), now.Format(time.RFC3339), signExpireHours)
+	}
+	if signTime.After(now.Add(signatureClockSkew)) {
+		return CodeUnauthorized, fmt.Errorf("签名时间超出允许时钟偏差，签名时间: %s，当前时间: %s，允许偏差: %s",
+			signTime.Format(time.RFC3339), now.Format(time.RFC3339), signatureClockSkew)
 	}
 
 	signStr := fmt.Sprintf("%s|%s|%s", appid, client.Secret, timestampStr)
@@ -957,13 +985,25 @@ func isChangeInWhitelist(changeKey string) bool {
 	return hotReloadWhitelist[changeKey]
 }
 
+func getRedisPrefix() string {
+	cfgMutex.RLock()
+	defer cfgMutex.RUnlock()
+	return cfg.Redis.Prefix
+}
+
 func validateConfig(c *Config) error {
+	accountIDs := make(map[string]struct{}, len(c.Accounts))
 	for _, acc := range c.Accounts {
 		if acc.AppID == "" || acc.AppSecret == "" {
 			return fmt.Errorf("公众号配置异常: appid=%s 缺少appsecret", acc.AppID)
 		}
+		if _, exists := accountIDs[acc.AppID]; exists {
+			return fmt.Errorf("公众号配置异常: appid=%s 重复配置", acc.AppID)
+		}
+		accountIDs[acc.AppID] = struct{}{}
 	}
 
+	clientIDs := make(map[string]struct{}, len(c.API.Clients))
 	for _, cli := range c.API.Clients {
 		if cli.Status != "enabled" && cli.Status != "disabled" {
 			return fmt.Errorf("客户端配置异常: appid=%s status非法", cli.AppID)
@@ -971,6 +1011,10 @@ func validateConfig(c *Config) error {
 		if cli.AppID == "" || cli.Secret == "" {
 			return fmt.Errorf("客户端配置异常: appid=%s 缺少secret", cli.AppID)
 		}
+		if _, exists := clientIDs[cli.AppID]; exists {
+			return fmt.Errorf("客户端配置异常: appid=%s 重复配置", cli.AppID)
+		}
+		clientIDs[cli.AppID] = struct{}{}
 	}
 
 	if c.WeChat.RefreshAhead < 0 {
@@ -1042,9 +1086,9 @@ func reloadConfig() error {
 	cfg = newCfg
 	cfgMutex.Unlock()
 
-	updateClientCache(cfg.API.Clients)
-	manager.UpdateAccounts(cfg.Accounts)
-	manager.UpdateWeChatConfig(cfg.WeChat)
+	updateClientCache(newCfg.API.Clients)
+	manager.UpdateAccounts(newCfg.Accounts)
+	manager.UpdateWeChatConfig(newCfg.WeChat)
 
 	logger.Info("配置热重载成功",
 		zap.Any("allowed_changes", allowedChanges),
@@ -1061,11 +1105,15 @@ func startConfigHotReload() {
 	}
 	defer watcher.Close()
 
-	if err := watcher.Add("config/config.yaml"); err != nil {
-		logger.Fatal("添加配置文件监听失败", zap.Error(err))
+	configPath := "config/config.yaml"
+	configDir := filepath.Dir(configPath)
+	configBase := filepath.Base(configPath)
+
+	if err := watcher.Add(configDir); err != nil {
+		logger.Fatal("添加配置目录监听失败", zap.Error(err))
 	}
 
-	logger.Info("配置热重载已启动", zap.String("watch_file", "config/config.yaml"))
+	logger.Info("配置热重载已启动", zap.String("watch_file", configPath))
 
 	const debounceDuration = 500 * time.Millisecond
 	var (
@@ -1096,7 +1144,10 @@ func startConfigHotReload() {
 				logger.Warn("配置监听事件通道已关闭")
 				return
 			}
-			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+			if filepath.Base(event.Name) != configBase {
+				continue
+			}
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
 				triggerReload(event.Name)
 			}
 

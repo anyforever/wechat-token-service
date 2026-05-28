@@ -1,0 +1,189 @@
+package main
+
+import (
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"go.uber.org/zap"
+)
+
+func TestValidateConfigRejectsDuplicateAccounts(t *testing.T) {
+	cfg := &Config{
+		WeChat: WeChatConfig{AutoRefreshInterval: time.Minute},
+		API: APIConfig{
+			SignExpireHours: 1,
+			Clients:         []APIClient{{AppID: "client-1", Secret: "secret", Status: "enabled"}},
+		},
+		Accounts: []Account{
+			{AppID: "wx-1", AppSecret: "secret-a"},
+			{AppID: "wx-1", AppSecret: "secret-b"},
+		},
+	}
+
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "重复配置") {
+		t.Fatalf("expected duplicate account error, got %v", err)
+	}
+}
+
+func TestValidateConfigRejectsDuplicateClients(t *testing.T) {
+	cfg := &Config{
+		WeChat: WeChatConfig{AutoRefreshInterval: time.Minute},
+		API: APIConfig{
+			SignExpireHours: 1,
+			Clients: []APIClient{
+				{AppID: "client-1", Secret: "secret-a", Status: "enabled"},
+				{AppID: "client-1", Secret: "secret-b", Status: "enabled"},
+			},
+		},
+		Accounts: []Account{{AppID: "wx-1", AppSecret: "secret-a"}},
+	}
+
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "重复配置") {
+		t.Fatalf("expected duplicate client error, got %v", err)
+	}
+}
+
+func TestVerifySignatureRejectsFutureTimestamp(t *testing.T) {
+	privateKey, publicKey := mustGenerateKeyPair(t)
+	rsaPublicKey = publicKey
+	logger = zap.NewNop()
+	clientCache = map[string]APIClient{
+		"client-1": {AppID: "client-1", Secret: "secret-1", Status: "enabled"},
+	}
+	cfg = Config{API: APIConfig{SignExpireHours: 2}}
+
+	timestamp := time.Now().Add(signatureClockSkew + time.Minute).Unix()
+	signature := mustSignTimestamp(t, privateKey, "client-1", "secret-1", timestamp)
+
+	code, err := verifySignature("client-1", signature, toTimestamp(timestamp))
+	if err == nil {
+		t.Fatal("expected future timestamp to be rejected")
+	}
+	if code != CodeUnauthorized {
+		t.Fatalf("expected unauthorized code, got %d", code)
+	}
+	if !strings.Contains(err.Error(), "时钟偏差") {
+		t.Fatalf("expected clock skew error, got %v", err)
+	}
+}
+
+func TestVerifySignatureAcceptsValidTimestamp(t *testing.T) {
+	privateKey, publicKey := mustGenerateKeyPair(t)
+	rsaPublicKey = publicKey
+	logger = zap.NewNop()
+	clientCache = map[string]APIClient{
+		"client-1": {AppID: "client-1", Secret: "secret-1", Status: "enabled"},
+	}
+	cfg = Config{API: APIConfig{SignExpireHours: 2}}
+
+	timestamp := time.Now().Unix()
+	signature := mustSignTimestamp(t, privateKey, "client-1", "secret-1", timestamp)
+
+	code, err := verifySignature("client-1", signature, toTimestamp(timestamp))
+	if err != nil {
+		t.Fatalf("expected valid signature, got %v", err)
+	}
+	if code != CodeSuccess {
+		t.Fatalf("expected success code, got %d", code)
+	}
+}
+
+func TestLoadRSAPublicKeyFromFile(t *testing.T) {
+	privateKey, publicKey := mustGenerateKeyPair(t)
+	publicDER, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		t.Fatalf("marshal public key: %v", err)
+	}
+	publicPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER})
+	keyFile, err := os.CreateTemp(t.TempDir(), "rsa-public-*.pem")
+	if err != nil {
+		t.Fatalf("create temp key file: %v", err)
+	}
+	if _, err := keyFile.Write(publicPEM); err != nil {
+		t.Fatalf("write temp key file: %v", err)
+	}
+	if err := keyFile.Close(); err != nil {
+		t.Fatalf("close temp key file: %v", err)
+	}
+
+	logger = zap.NewNop()
+	cfg = Config{API: APIConfig{RSAPublicKey: keyFile.Name()}}
+	if err := loadRSAPublicKey(); err != nil {
+		t.Fatalf("load rsa public key from file: %v", err)
+	}
+
+	timestamp := time.Now().Unix()
+	clientCache = map[string]APIClient{
+		"client-1": {AppID: "client-1", Secret: "secret-1", Status: "enabled"},
+	}
+	cfg.API.SignExpireHours = 2
+	signature := mustSignTimestamp(t, privateKey, "client-1", "secret-1", timestamp)
+	if code, err := verifySignature("client-1", signature, toTimestamp(timestamp)); err != nil || code != CodeSuccess {
+		t.Fatalf("verify signature with loaded file key: code=%d err=%v", code, err)
+	}
+}
+
+func TestIsFatalWeChatError(t *testing.T) {
+	if !isFatalWeChatError(assertErr("微信API错误: errcode=40013, errmsg=invalid appid")) {
+		t.Fatal("expected fatal errcode to be detected")
+	}
+	if isFatalWeChatError(assertErr("temporary upstream timeout")) {
+		t.Fatal("expected transient error to remain retryable")
+	}
+}
+
+func mustGenerateKeyPair(t *testing.T) (*rsa.PrivateKey, *rsa.PublicKey) {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa key: %v", err)
+	}
+	publicDER, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		t.Fatalf("marshal public key: %v", err)
+	}
+	block, _ := pem.Decode(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))
+	if block == nil {
+		t.Fatal("decode generated public key")
+	}
+	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse generated public key: %v", err)
+	}
+	publicKey, ok := parsed.(*rsa.PublicKey)
+	if !ok {
+		t.Fatal("parsed public key is not rsa")
+	}
+	return privateKey, publicKey
+}
+
+func mustSignTimestamp(t *testing.T, privateKey *rsa.PrivateKey, appid, secret string, timestamp int64) string {
+	t.Helper()
+	payload := appid + "|" + secret + "|" + toTimestamp(timestamp)
+	hash := sha256.Sum256([]byte(payload))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, hash[:])
+	if err != nil {
+		t.Fatalf("sign payload: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(sig)
+}
+
+func toTimestamp(ts int64) string {
+	return strconv.FormatInt(ts, 10)
+}
+
+type assertErr string
+
+func (e assertErr) Error() string { return string(e) }

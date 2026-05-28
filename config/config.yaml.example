@@ -16,11 +16,11 @@ wechat:
   auto_refresh_interval: "10m"
 
 api:
-  # RSA 公钥，用于签名验证
-  rsa_public_key: |
-    -----BEGIN PUBLIC KEY-----
-    YOUR_RSA_PUBLIC_KEY_HERE
-    -----END PUBLIC KEY-----
+  # RSA 公钥用于签名验证；仅支持两种写法：
+  # 1) 直接填写 PEM 公钥内容
+  # 2) 填写公钥文件路径（推荐），不要填写私钥内容
+  # 示例文件：config/rsa_public_key.pem；私钥仅供签名方保管：config/rsa_private_key.pem
+  rsa_public_key: "config/rsa_public_key.pem"
   sign_expire_hours: 2
   clients:
     - appid: "your_client_appid"
