@@ -98,7 +98,7 @@ wechat:
   auto_refresh_interval: "10m"
 
 api:
-  rsa_public_key: "config/rsa_public_key.pem"
+  rsa_public_key: "rsa_public_key.pem"
   sign_expire_hours: 2
   clients:
     - appid: "your_client_appid"
@@ -108,11 +108,12 @@ api:
 logger:
   level: "info"
   encoding: "json"
-  output_path: "stdout"
-  max_size: 100
-  max_backup: 7
-  max_age: 30
-  compress: false
+  output_path: "stdout"   # stdout、单文件路径，或日志目录（如 logs）
+  max_size: 100            # 仅在 output_path 为单文件路径时生效
+  max_backup: 7            # 仅在 output_path 为单文件路径时生效
+  max_age: 30              # 仅在 output_path 为单文件路径时生效
+  compress: false          # 仅在 output_path 为单文件路径时生效
+  retention_days: 7        # 仅在 output_path 为目录时生效，0 表示不清理旧日志
 
 accounts:
   - appid: "wx123"
@@ -150,8 +151,12 @@ accounts:
 #### logger
 - `level`：日志级别，支持 `debug` / `info` / `warn` / `error`
 - `encoding`：日志格式，支持 `json` / `console`
-- `output_path`：`stdout` 或日志文件路径
-- `max_size` / `max_backup` / `max_age` / `compress`：日志滚动参数
+- `output_path`：支持三种写法：
+  1. `stdout`：输出到控制台（默认）
+  2. 单文件路径：如 `logs/app.log`，按 lumberjack 规则滚动
+  3. 目录路径：如 `logs`，按天写入文件，文件名格式为 `wechat-token-manager-YYYY-MM-DD.log`
+- `max_size` / `max_backup` / `max_age` / `compress`：仅在 `output_path` 为单文件路径时生效
+- `retention_days`：仅在 `output_path` 为目录时生效，保留最近多少天的日志文件；`0` 或负数表示不自动清理
 
 #### accounts
 微信公众号列表：
@@ -195,6 +200,12 @@ appid|client_secret|timestamp
 go run .
 ```
 
+默认会读取项目目录下的：
+
+```text
+config/config.yaml
+```
+
 ### 2. 指定配置文件启动
 
 ```bash
@@ -206,6 +217,10 @@ go run . -config config/config.yaml
 ```bash
 ./wechat-token-manager -config /your/path/config.yaml
 ```
+
+指定 `-config` 后：
+- 程序使用该配置文件启动
+- 配置中的相对路径（如 `api.rsa_public_key`、日志目录等）都相对该配置文件所在目录解析
 
 ### 3. 编译运行
 
@@ -329,13 +344,13 @@ go test ./...
 ```
 
 ---
-
 ## 部署建议
 
 - Redis 使用独立 DB 或唯一前缀隔离环境
 - 生产环境不要把私钥提交到代码仓库
 - 公钥建议使用文件路径配置，避免把 PEM 直接塞进 YAML
 - 多实例部署时保持配置一致
+- 线上如需落盘日志，建议将 `logger.output_path` 配置为目录，例如 `logs`
 - 建议配合进程管理器或容器平台运行
 
 ---
@@ -364,3 +379,20 @@ go test ./...
 
 ### 4. 指定配置文件后找不到公钥文件
 如果 `rsa_public_key` 使用相对路径，该路径是相对**配置文件所在目录**解析的，不是相对当前执行目录。
+
+### 5. 如何让日志写入 logs 目录并按天分文件
+将配置改为：
+
+```yaml
+logger:
+  output_path: "logs"
+  retention_days: 7
+```
+
+此时日志会写入配置文件所在目录下的 `logs/`，并按天生成文件，例如：
+
+```text
+logs/wechat-token-manager-2026-05-28.log
+```
+
+程序会在写入新日期日志文件时，自动清理超出 `retention_days` 的旧日志文件。

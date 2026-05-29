@@ -19,8 +19,8 @@ api:
   # RSA 公钥用于签名验证；仅支持两种写法：
   # 1) 直接填写 PEM 公钥内容
   # 2) 填写公钥文件路径（推荐），不要填写私钥内容
-  # 示例文件：config/rsa_public_key.pem；私钥仅供签名方保管：config/rsa_private_key.pem
-  rsa_public_key: "config/rsa_public_key.pem"
+  # 示例文件：rsa_public_key.pem；私钥仅供签名方保管：rsa_private_key.pem
+  rsa_public_key: "rsa_public_key.pem"
   sign_expire_hours: 2
   clients:
     - appid: "your_client_appid"
@@ -30,11 +30,12 @@ api:
 logger:
   level: "info"
   encoding: "json"
-  output_path: "stdout"  # stdout 或日志文件路径
+  output_path: "stdout"  # stdout、单文件路径，或日志目录（如 logs）
   max_size: 100
   max_backup: 7
   max_age: 30
   compress: false
+  retention_days: 7       # 仅在 output_path 为目录时生效，0 表示不清理旧日志
 
 accounts:
   - appid: "wx123"

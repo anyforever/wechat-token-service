@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,6 +33,15 @@ func TestResolveConfigAssetPathUsesConfigDirectory(t *testing.T) {
 	baseDir := filepath.Join("/tmp", "deploy", "conf")
 	resolved := resolveConfigAssetPath(baseDir, "keys/public.pem")
 	expected := filepath.Clean(filepath.Join(baseDir, "keys/public.pem"))
+	if resolved != expected {
+		t.Fatalf("expected %q, got %q", expected, resolved)
+	}
+}
+
+func TestResolveConfigAssetPathStripsConfigDirPrefix(t *testing.T) {
+	baseDir := filepath.Join("/tmp", "deploy", "conf")
+	resolved := resolveConfigAssetPath(baseDir, "conf/rsa_public_key.pem")
+	expected := filepath.Clean(filepath.Join(baseDir, "rsa_public_key.pem"))
 	if resolved != expected {
 		t.Fatalf("expected %q, got %q", expected, resolved)
 	}
@@ -196,6 +206,72 @@ func TestIsFatalWeChatError(t *testing.T) {
 	}
 	if isFatalWeChatError(assertErr("temporary upstream timeout")) {
 		t.Fatal("expected transient error to remain retryable")
+	}
+}
+
+func TestBuildLogWriteSyncerReturnsDailyWriterForDirectory(t *testing.T) {
+	writer, closer, err := buildLogWriteSyncer(LoggerConfig{OutputPath: filepath.Join(t.TempDir(), "logs")})
+	if err != nil {
+		t.Fatalf("build log write syncer: %v", err)
+	}
+	t.Cleanup(func() {
+		if closer != nil {
+			_ = closer.Close()
+		}
+	})
+	if writer == nil {
+		t.Fatal("expected write syncer")
+	}
+	if _, ok := closer.(*dailyRotateWriter); !ok {
+		t.Fatalf("expected dailyRotateWriter closer, got %T", closer)
+	}
+}
+
+func TestDailyRotateWriterCleanupExpired(t *testing.T) {
+	logDir := t.TempDir()
+	now := time.Date(2026, 5, 28, 10, 0, 0, 0, time.UTC)
+	keepDay := now.AddDate(0, 0, -1)
+	removeDay := now.AddDate(0, 0, -2)
+	if err := os.WriteFile(buildDailyLogFilePath(logDir, "wechat-token-manager", keepDay), []byte("keep"), 0o644); err != nil {
+		t.Fatalf("seed keep log: %v", err)
+	}
+	if err := os.WriteFile(buildDailyLogFilePath(logDir, "wechat-token-manager", removeDay), []byte("remove"), 0o644); err != nil {
+		t.Fatalf("seed remove log: %v", err)
+	}
+	writer, err := newDailyRotateWriter(logDir, "wechat-token-manager", 0o755, 2, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("new daily rotate writer: %v", err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	if _, err := writer.Write([]byte("current")); err != nil {
+		t.Fatalf("write current log: %v", err)
+	}
+	if _, err := os.Stat(buildDailyLogFilePath(logDir, "wechat-token-manager", removeDay)); !os.IsNotExist(err) {
+		t.Fatalf("expected expired log removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(buildDailyLogFilePath(logDir, "wechat-token-manager", keepDay)); err != nil {
+		t.Fatalf("expected retained log to exist: %v", err)
+	}
+}
+
+func TestDailyRotateWriterKeepsAllLogsWhenRetentionDisabled(t *testing.T) {
+	logDir := t.TempDir()
+	now := time.Date(2026, 5, 28, 10, 0, 0, 0, time.UTC)
+	oldDay := now.AddDate(0, 0, -10)
+	oldPath := buildDailyLogFilePath(logDir, "wechat-token-manager", oldDay)
+	if err := os.WriteFile(oldPath, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("seed old log: %v", err)
+	}
+	writer, err := newDailyRotateWriter(logDir, "wechat-token-manager", 0o755, 0, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("new daily rotate writer: %v", err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	if _, err := io.WriteString(writer, "current"); err != nil {
+		t.Fatalf("write current log: %v", err)
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("expected old log to remain: %v", err)
 	}
 }
 

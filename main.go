@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
@@ -94,13 +95,30 @@ type APIConfig struct {
 }
 
 type LoggerConfig struct {
-	Level      string `yaml:"level"`
-	Encoding   string `yaml:"encoding"`
-	OutputPath string `yaml:"output_path"`
-	MaxSize    int    `yaml:"max_size"`
-	MaxBackup  int    `yaml:"max_backup"`
-	MaxAge     int    `yaml:"max_age"`
-	Compress   bool   `yaml:"compress"`
+	Level         string `yaml:"level"`
+	Encoding      string `yaml:"encoding"`
+	OutputPath    string `yaml:"output_path"`
+	MaxSize       int    `yaml:"max_size"`
+	MaxBackup     int    `yaml:"max_backup"`
+	MaxAge        int    `yaml:"max_age"`
+	Compress      bool   `yaml:"compress"`
+	RetentionDays int    `yaml:"retention_days"`
+}
+
+type rotatingWriteCloser interface {
+	io.WriteCloser
+	Rotate() error
+}
+
+type dailyRotateWriter struct {
+	dir           string
+	baseName      string
+	perm          fs.FileMode
+	retentionDays int
+	now           func() time.Time
+	currentDay    string
+	file          *os.File
+	mu            sync.Mutex
 }
 
 type Account struct {
@@ -130,6 +148,7 @@ var (
 	cfg            Config
 	cfgMutex       sync.RWMutex
 	logger         *zap.Logger
+	logCloser      io.Closer
 	redisClient    *redis.Client
 	manager        *TokenManager
 	ctx, ctxCancel = context.WithCancel(context.Background())
@@ -1165,6 +1184,155 @@ func startConfigHotReload(configPath string) {
 	}
 }
 
+func isStdoutOutput(path string) bool {
+	return strings.EqualFold(strings.TrimSpace(path), "stdout")
+}
+
+func buildDailyLogFilePath(dir, baseName string, now time.Time) string {
+	datePart := now.Format("2006-01-02")
+	return filepath.Join(dir, fmt.Sprintf("%s-%s.log", baseName, datePart))
+}
+
+func newDailyRotateWriter(dir, baseName string, perm fs.FileMode, retentionDays int, now func() time.Time) (*dailyRotateWriter, error) {
+	if now == nil {
+		now = time.Now
+	}
+	writer := &dailyRotateWriter{
+		dir:           dir,
+		baseName:      baseName,
+		perm:          perm,
+		retentionDays: retentionDays,
+		now:           now,
+	}
+	if err := writer.rotateAt(now()); err != nil {
+		return nil, err
+	}
+	return writer, nil
+}
+
+func (w *dailyRotateWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err := w.rotateAt(w.now()); err != nil {
+		return 0, err
+	}
+	return w.file.Write(p)
+}
+
+func (w *dailyRotateWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
+	err := w.file.Close()
+	w.file = nil
+	return err
+}
+
+func (w *dailyRotateWriter) Rotate() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.rotateAt(w.now())
+}
+
+func (w *dailyRotateWriter) rotateAt(now time.Time) error {
+	day := now.Format("2006-01-02")
+	if w.file != nil && w.currentDay == day {
+		return nil
+	}
+	if err := os.MkdirAll(w.dir, w.perm); err != nil {
+		return err
+	}
+	path := buildDailyLogFilePath(w.dir, w.baseName, now)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, w.perm)
+	if err != nil {
+		return err
+	}
+	if w.file != nil {
+		_ = w.file.Close()
+	}
+	w.file = file
+	w.currentDay = day
+	if err := w.cleanupExpired(now); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *dailyRotateWriter) cleanupExpired(now time.Time) error {
+	if w.retentionDays <= 0 {
+		return nil
+	}
+	entries, err := os.ReadDir(w.dir)
+	if err != nil {
+		return err
+	}
+	cutoff := now.AddDate(0, 0, -(w.retentionDays - 1))
+	cutoffDay := cutoff.Format("2006-01-02")
+	prefix := w.baseName + "-"
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".log") {
+			continue
+		}
+		datePart := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".log")
+		if _, err := time.Parse("2006-01-02", datePart); err != nil {
+			continue
+		}
+		if datePart >= cutoffDay {
+			continue
+		}
+		if err := os.Remove(filepath.Join(w.dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func buildLogWriteSyncer(loggerCfg LoggerConfig) (zapcore.WriteSyncer, io.Closer, error) {
+	if isStdoutOutput(loggerCfg.OutputPath) {
+		return zapcore.AddSync(os.Stdout), nil, nil
+	}
+
+	cleanPath := filepath.Clean(strings.TrimSpace(loggerCfg.OutputPath))
+	if cleanPath == "" || cleanPath == "." {
+		return nil, nil, fmt.Errorf("日志输出路径不能为空")
+	}
+
+	info, err := os.Stat(cleanPath)
+	if err == nil && info.IsDir() {
+		writer, err := newDailyRotateWriter(cleanPath, "wechat-token-manager", 0o755, loggerCfg.RetentionDays, time.Now)
+		if err != nil {
+			return nil, nil, err
+		}
+		return zapcore.AddSync(writer), writer, nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, err
+	}
+	if filepath.Ext(cleanPath) == "" {
+		writer, err := newDailyRotateWriter(cleanPath, "wechat-token-manager", 0o755, loggerCfg.RetentionDays, time.Now)
+		if err != nil {
+			return nil, nil, err
+		}
+		return zapcore.AddSync(writer), writer, nil
+	}
+
+	lumberjackLogger := &lumberjack.Logger{
+		Filename:   cleanPath,
+		MaxSize:    loggerCfg.MaxSize,
+		MaxBackups: loggerCfg.MaxBackup,
+		MaxAge:     loggerCfg.MaxAge,
+		Compress:   loggerCfg.Compress,
+	}
+	return zapcore.AddSync(lumberjackLogger), lumberjackLogger, nil
+}
+
 // -------------------------- 工具函数 --------------------------
 func initLogger() {
 	cfgMutex.RLock()
@@ -1194,18 +1362,16 @@ func initLogger() {
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 
-	var writeSyncer zapcore.WriteSyncer
-	if loggerCfg.OutputPath == "stdout" {
-		writeSyncer = zapcore.AddSync(os.Stdout)
-	} else {
-		lumberjackLogger := &lumberjack.Logger{
-			Filename:   loggerCfg.OutputPath,
-			MaxSize:    loggerCfg.MaxSize,
-			MaxBackups: loggerCfg.MaxBackup,
-			MaxAge:     loggerCfg.MaxAge,
-			Compress:   loggerCfg.Compress,
-		}
-		writeSyncer = zapcore.AddSync(lumberjackLogger)
+	writeSyncer, newLogCloser, err := buildLogWriteSyncer(loggerCfg)
+	if err != nil {
+		panic(fmt.Sprintf("初始化日志输出失败: %v", err))
+	}
+	if newLogCloser != nil {
+		defer func() {
+			if logger == nil {
+				_ = newLogCloser.Close()
+			}
+		}()
 	}
 
 	var encoder zapcore.Encoder
@@ -1216,8 +1382,14 @@ func initLogger() {
 	}
 
 	core := zapcore.NewCore(encoder, writeSyncer, level)
-	logger = zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1))
-	zap.ReplaceGlobals(logger)
+	newLogger := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1))
+	oldCloser := logCloser
+	logger = newLogger
+	logCloser = newLogCloser
+	zap.ReplaceGlobals(newLogger)
+	if oldCloser != nil && oldCloser != newLogCloser {
+		_ = oldCloser.Close()
+	}
 }
 
 func resolveConfigAssetPath(baseDir, ref string) string {
@@ -1227,6 +1399,11 @@ func resolveConfigAssetPath(baseDir, ref string) string {
 	}
 	if baseDir == "" {
 		return ref
+	}
+	baseName := filepath.Base(baseDir)
+	prefix := baseName + string(filepath.Separator)
+	if strings.HasPrefix(ref, prefix) {
+		ref = strings.TrimPrefix(ref, prefix)
 	}
 	return filepath.Clean(filepath.Join(baseDir, ref))
 }
@@ -1409,6 +1586,9 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Fatal("服务关闭失败", zap.Error(err))
+	}
+	if logCloser != nil {
+		_ = logCloser.Close()
 	}
 
 	logger.Info("服务已优雅关闭")
