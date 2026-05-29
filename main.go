@@ -11,7 +11,9 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -36,6 +38,7 @@ import (
 var Version = "v1.0.0" // 编译时注入版本号
 
 const (
+	defaultConfigPath  = "config/config.yaml"
 	requestTimeout     = 10 * time.Second
 	maxRefreshRetries  = 3
 	tokenLockExpire    = 75 * time.Second
@@ -131,6 +134,7 @@ var (
 	manager        *TokenManager
 	ctx, ctxCancel = context.WithCancel(context.Background())
 	rsaPublicKey   *rsa.PublicKey
+	configBaseDir  string
 	clientCache    map[string]APIClient
 	clientMutex    sync.RWMutex
 
@@ -704,9 +708,10 @@ func loadRSAPublicKey() error {
 	}
 
 	if !strings.Contains(publicKeyContent, "-----BEGIN") {
-		keyData, err := os.ReadFile(publicKeyContent)
+		keyPath := resolveConfigAssetPath(configBaseDir, publicKeyContent)
+		keyData, err := os.ReadFile(keyPath)
 		if err != nil {
-			return fmt.Errorf("读取RSA公钥文件失败: path=%s, err=%v", publicKeyContent, err)
+			return fmt.Errorf("读取RSA公钥文件失败: path=%s, err=%v", keyPath, err)
 		}
 		publicKeyContent = string(keyData)
 	}
@@ -1030,8 +1035,8 @@ func validateConfig(c *Config) error {
 	return nil
 }
 
-func reloadConfig() error {
-	file, err := os.Open("config/config.yaml")
+func reloadConfig(configPath string) error {
+	file, err := os.Open(configPath)
 	if err != nil {
 		return fmt.Errorf("读取配置文件失败: %v", err)
 	}
@@ -1098,14 +1103,13 @@ func reloadConfig() error {
 	return nil
 }
 
-func startConfigHotReload() {
+func startConfigHotReload(configPath string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.Fatal("配置热重载监听初始化失败", zap.Error(err))
 	}
 	defer watcher.Close()
 
-	configPath := "config/config.yaml"
 	configDir := filepath.Dir(configPath)
 	configBase := filepath.Base(configPath)
 
@@ -1131,7 +1135,7 @@ func startConfigHotReload() {
 		}
 		debounceTimer = time.AfterFunc(debounceDuration, func() {
 			logger.Info("检测到配置文件变更，开始热重载", zap.String("file", filename))
-			if err := reloadConfig(); err != nil {
+			if err := reloadConfig(configPath); err != nil {
 				logger.Error("配置热重载失败", zap.Error(err))
 			}
 		})
@@ -1216,8 +1220,21 @@ func initLogger() {
 	zap.ReplaceGlobals(logger)
 }
 
-func loadConfig() {
-	file, err := os.Open("config/config.yaml")
+func resolveConfigAssetPath(baseDir, ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" || strings.Contains(ref, "-----BEGIN") || filepath.IsAbs(ref) {
+		return ref
+	}
+	if baseDir == "" {
+		return ref
+	}
+	return filepath.Clean(filepath.Join(baseDir, ref))
+}
+
+func loadConfig(configPath string) {
+	configBaseDir = filepath.Dir(configPath)
+
+	file, err := os.Open(configPath)
 	if err != nil {
 		panic(fmt.Sprintf("加载配置文件失败: %v", err))
 	}
@@ -1231,6 +1248,34 @@ func loadConfig() {
 	if err := validateConfig(&cfg); err != nil {
 		panic(fmt.Sprintf("初始配置校验失败: %v", err))
 	}
+}
+
+func normalizeConfigPath(configPath string) (string, error) {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return "", errors.New("配置文件路径不能为空")
+	}
+
+	cleanPath := filepath.Clean(configPath)
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return "", fmt.Errorf("解析配置文件绝对路径失败: %v", err)
+	}
+
+	return absPath, nil
+}
+
+func parseConfigPath(args []string) (string, error) {
+	fs := flag.NewFlagSet("wechat-token-manager", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	configPath := defaultConfigPath
+	fs.StringVar(&configPath, "config", defaultConfigPath, "配置文件路径")
+	if err := fs.Parse(args); err != nil {
+		return "", err
+	}
+
+	return normalizeConfigPath(configPath)
 }
 
 func initRedis() {
@@ -1259,8 +1304,13 @@ func setServerReady(ready bool) {
 
 // -------------------------- 主函数 --------------------------
 func main() {
+	configPath, err := parseConfigPath(os.Args[1:])
+	if err != nil {
+		panic(fmt.Sprintf("解析启动参数失败: %v", err))
+	}
+
 	// 1. 加载配置
-	loadConfig()
+	loadConfig(configPath)
 
 	// 2. 初始化日志
 	initLogger()
@@ -1283,7 +1333,7 @@ func main() {
 	logger.Info("Token管理器初始化完成", zap.Int("account_count", len(cfg.Accounts)))
 
 	// 7. 启动配置热重载
-	go startConfigHotReload()
+	go startConfigHotReload(configPath)
 
 	// 8. 启动前预热：预加载所有公众号Token（失败降级处理，不阻止启动）
 	logger.Info("开始服务预热...")
@@ -1337,6 +1387,7 @@ func main() {
 	logger.Info("微信公众号Token管理系统启动成功",
 		zap.String("port", cfg.Server.Port),
 		zap.String("version", Version),
+		zap.String("config_path", configPath),
 		zap.Bool("hot_reload_enabled", true))
 
 	quit := make(chan os.Signal, 1)

@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,6 +17,60 @@ import (
 
 	"go.uber.org/zap"
 )
+
+func TestNormalizeConfigPathReturnsAbsolutePath(t *testing.T) {
+	configPath, err := normalizeConfigPath("config/config.yaml")
+	if err != nil {
+		t.Fatalf("normalize config path: %v", err)
+	}
+	if !filepath.IsAbs(configPath) {
+		t.Fatalf("expected absolute config path, got %q", configPath)
+	}
+}
+
+func TestResolveConfigAssetPathUsesConfigDirectory(t *testing.T) {
+	baseDir := filepath.Join("/tmp", "deploy", "conf")
+	resolved := resolveConfigAssetPath(baseDir, "keys/public.pem")
+	expected := filepath.Clean(filepath.Join(baseDir, "keys/public.pem"))
+	if resolved != expected {
+		t.Fatalf("expected %q, got %q", expected, resolved)
+	}
+}
+
+func TestParseConfigPathDefault(t *testing.T) {
+	configPath, err := parseConfigPath(nil)
+	if err != nil {
+		t.Fatalf("parse default config path: %v", err)
+	}
+	expected, err := normalizeConfigPath(defaultConfigPath)
+	if err != nil {
+		t.Fatalf("normalize default config path: %v", err)
+	}
+	if configPath != expected {
+		t.Fatalf("expected default config path %q, got %q", expected, configPath)
+	}
+}
+
+func TestParseConfigPathOverride(t *testing.T) {
+	configPath, err := parseConfigPath([]string{"-config", "custom/config.yaml"})
+	if err != nil {
+		t.Fatalf("parse custom config path: %v", err)
+	}
+	expected, err := normalizeConfigPath("custom/config.yaml")
+	if err != nil {
+		t.Fatalf("normalize custom config path: %v", err)
+	}
+	if configPath != expected {
+		t.Fatalf("expected custom config path %q, got %q", expected, configPath)
+	}
+}
+
+func TestParseConfigPathRejectsBlank(t *testing.T) {
+	_, err := parseConfigPath([]string{"-config", "   "})
+	if err == nil {
+		t.Fatal("expected blank config path to fail")
+	}
+}
 
 func TestValidateConfigRejectsDuplicateAccounts(t *testing.T) {
 	cfg := &Config{
