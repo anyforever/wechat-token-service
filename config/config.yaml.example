@@ -26,6 +26,9 @@ api:
     - appid: "your_client_appid"
       secret: "your_client_secret"
       status: "enabled"
+    - appid: "your_client_appid2"
+      secret: "your_client_secret2"
+      status: "enabled"
 
 logger:
   level: "info"
@@ -40,3 +43,5 @@ logger:
 accounts:
   - appid: "wx123"
     appsecret: "secret123"
+  - appid: "wx456"
+    appsecret: "secret456"

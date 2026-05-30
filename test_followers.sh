@@ -4,9 +4,9 @@
 set -e
 
 BASE_URL="http://localhost:8080"
-CLIENT_APPID="yuyue"
+CLIENT_APPID="client-1"
 CLIENT_SECRET="your_client_secret"
-WECHAT_APPID="wxa1666cf8a9487097"
+WECHAT_APPID="wechat_appid"
 PRIVATE_KEY="./config/rsa_private_key.pem"
 
 echo "===== Step 1: 生成 RSA 签名 ====="

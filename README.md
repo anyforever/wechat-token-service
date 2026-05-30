@@ -134,16 +134,16 @@ accounts:
 - `prefix`：Redis Key 前缀
 
 #### wechat
-- `token_api`：微信获取 Token 接口地址
-- `refresh_ahead`：Token 提前刷新秒数
-- `auto_refresh_interval`：自动刷新轮询周期
+- `token_api`：微信获取 Token 接口地址（支持热重载）
+- `refresh_ahead`：Token 提前刷新秒数（支持热重载）
+- `auto_refresh_interval`：自动刷新轮询周期（支持热重载）
 
 #### api
 - `rsa_public_key`：RSA 公钥配置，仅支持两种写法：
   1. 直接填写 PEM 公钥内容
   2. 填写公钥文件路径（推荐）
-- `sign_expire_hours`：签名过期时间，单位小时
-- `clients`：允许访问本服务的调用方列表
+- `sign_expire_hours`：签名过期时间，单位小时（支持热重载）
+- `clients`：允许访问本服务的调用方列表（支持热重载）
   - `appid`：调用方标识
   - `secret`：调用方签名密钥
   - `status`：`enabled` / `disabled`
@@ -159,9 +159,23 @@ accounts:
 - `retention_days`：仅在 `output_path` 为目录时生效，保留最近多少天的日志文件；`0` 或负数表示不自动清理
 
 #### accounts
-微信公众号列表：
-- `appid`：公众号 AppID
-- `appsecret`：公众号 AppSecret
+- `accounts`：公众号账号列表（支持热重载）
+  - `appid`：公众号标识
+  - `appsecret`：公众号密钥
+
+#### 热重载说明
+- 以下配置项变更后无需重启，程序会自动热加载：
+  - `accounts`
+  - `api.clients`
+  - `api.sign_expire_hours`
+  - `wechat.refresh_ahead`
+  - `wechat.auto_refresh_interval`
+  - `wechat.token_api`
+- 以下配置项变更后不会热加载，仍需重启服务：
+  - `server.*`
+  - `redis.*`
+  - `logger.*`
+  - `api.rsa_public_key`
 
 ---
 
