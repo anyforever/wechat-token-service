@@ -19,6 +19,7 @@ config/public.key
 
 # Compiled binary
 wechat-token-manager
+build/
 
 # Cross-platform build output
 dist/

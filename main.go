@@ -36,7 +36,7 @@ import (
 )
 
 // -------------------------- 版本信息 --------------------------
-var Version = "v1.0.0" // 编译时注入版本号
+var Version = "v1.1.0" // 编译时注入版本号
 
 const (
 	defaultConfigPath  = "config/config.yaml"
